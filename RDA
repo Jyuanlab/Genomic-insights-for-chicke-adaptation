@@ -1,0 +1,243 @@
+# Rscript for RDA
+##########
+# Prepare data
+#########
+# make environment data for RDA
+ocr = read.csv('env_data/res/occu_point_dat.csv',stringsAsFactors=F)
+head(ocr);dim(ocr)
+
+site = read.csv('env_data/google_site/site_45_rename.csv',stringsAsFactors=F)
+tmp = merge(site,ocr,by='breed')
+
+fam = read.table('pca/env_geno_prune_autochr_pca.eigenvec',stringsAsFactors=F)
+names(fam)[1:5]=c('breed','sample','pc1','pc2','pc3')
+head(fam);dim(fam)
+
+env = merge(fam,tmp,by='breed',all.x=T)
+tail(env);dim(env)
+
+env = subset(env,select = c('sample','longitude','latitude','pc1','pc2','pc3',
+                            'bio_11','cec','bare','trees','cropland','srad_06','elev','breed'))
+head(env);dim(env)
+df = env[!env$breed %in% c('BBC','RRC','WLC', 'CCC','GFC','LWC','RJF','XYL','NCS'),]
+df$sample_id = paste0(df$breed,'_',df$sample)
+head(df);dim(df)
+
+#g = split(df$sample,df$breed)
+#len = data.frame(sapply(g,length))    # check number of samples in each breeds
+
+# make genome data for RDA
+geno = read.table('env_data/genome/env_geno_prune.traw',stringsAsFactors=F,sep='',header = T)
+head(geno,2);dim(geno)
+env_geno = as.data.frame(t(geno))
+env_geno[1:6,1:6];dim(env_geno)
+colnames(env_geno) = env_geno[2,]
+tmp = env_geno[-c(1:6),]
+tmp[1:10,1:10]
+tmp$sample_id = rownames(tmp)
+
+df = df[df$sample_id%in%rownames(tmp),]
+library('dplyr')
+tmp1 = df %>% 
+  mutate(sample_id = factor(sample_id, levels = rownames(tmp))) %>% 
+  arrange(sample_id)
+
+identical(rownames(tmp), tmp1$sample_id)
+head(df);dim(df)
+rownames(tmp) == tmp1$sample_id[FALSE]  #look if A same as B
+write.csv(tmp1,'env_data/res/env_1014.csv',row.names=F)   # save env data
+env_geno1014 = tmp[,-ncol(tmp)]
+for (i in 1:ncol(env_geno1014)) {
+  env_geno1014[,i] = as.integer(env_geno1014[,i])
+}
+str(env_geno1014)
+write.table(env_geno1014,'env_data/res/env_geno1014.txt',row.names=F,quote = F)   # save geno data
+
+env_dat1014 = tmp1
+
+#########
+# patial RDA
+########
+#
+env_dat1014 = read.csv('env_data/res/env_1014.csv',stringsAsFactors=F)
+env_geno1014 = read.table('env_data/res/env_geno1014.txt',header=T,stringsAsFactors = F,check.names = F)   
+str(env_geno1014)
+library('vegan')
+rda_partial = rda(env_geno1014 ~ bio_11+ cec+ bare+ trees+ cropland+ srad_06+
+                    Condition(longitude+ latitude+ pc1+ pc2+ pc3), data=env_dat1014, scale=T)  # ~ 2 hours
+rda_partial
+RsquareAdj(rda_partial) # 0.01938514 explained 1.96% variance
+
+summary(eigenvals(rda_partial, model = "constrained"))
+
+# Significance test for the RDA model (very long time > 24 hours)
+#signif.partialModel_500perm = anova.cca(rda_partial, permutations=how(nperm=499),parallel=getOption("mc.cores"))
+#signif.partialModel_500perm
+# Significance test for each axis (very long time > 24 hours)
+Sys.time()
+signif.axis = anova.cca(rda_partial, permutations = how(nperm = 20), by="axis",parallel=getOption("mc.cores")) # 10 permutations ~30 hours
+signif.axis
+Sys.time()
+
+#########
+# Identify outlier SNPs
+# SNP loadings in the ordination space will be used to determine outliers or candidates for local adaptation
+#########
+loading.rda = scores(rda_partial, choices=c(1:6), display="species") # return significant axis
+
+# First check the normal distribution of SNPs in all 5 significant axes
+# SNPs loading in the tails are more likely to be under selection as a function of those predictors
+
+tiff(file="env_data/fig/SNP_loadings_on_6RDAs.tiff", compression="lzw", width=3000, height=2700,res = 300)
+par(mfrow=c(3,2))
+hist(loading.rda[,1], main="Loadings on RDA1")
+hist(loading.rda[,2], main="Loadings on RDA2")
+hist(loading.rda[,3], main="Loadings on RDA3")
+hist(loading.rda[,4], main="Loadings on RDA4")
+hist(loading.rda[,5], main="Loadings on RDA5")
+hist(loading.rda[,6], main="Loadings on RDA6")
+dev.off()
+
+# Set a function to identify outliers SNPs 
+# that exceed SD>3.5 (two-tailed p-value = 0.0005) in both tails of normal distribution
+outliers <- function(x,z){
+  lims <- mean(x) + c(-1, 1) * z * sd(x)
+  x[x < lims[1] | x > lims[2]]
+}                        # x denotes SNP loading; z denotes folds
+
+tmp= list()
+for (i in c(1:6)) {
+  tmp[[i]] = outliers(loading.rda[,i],3)        #==== change outerlier folds
+  length(tmp[[i]])
+  # Organize the results by making one data frame 
+  # with the axis, SNP name, loading, & correlation with each predictor
+  tmp[[i]] = cbind.data.frame(rep(i,times=length(tmp[[i]])), names(tmp[[i]]), unname(tmp[[i]]))
+  colnames(tmp[[i]]) = c("axis","snp","loading")
+    
+}
+cand = do.call('rbind',tmp)     # bind all data frames in the list
+
+cand$snp = as.character(cand$snp)
+
+head(cand);dim(cand)
+
+predictors = subset (env_dat1014, select=c(bio_11,cec,bare,trees,cropland,srad_06))
+str(predictors)
+
+# correlation between outlier SNPs and the 6 environmental predictors
+tmp = matrix(nrow = nrow(cand),ncol = ncol(predictors))
+colnames(tmp) = c('bio_11','cec','bare','trees','cropland','srad_06')
+
+for (i in 1:nrow(cand)) {
+  nam = cand[i,2]
+  snp.gen = env_geno1014[,nam]
+  tmp[i,] = apply(predictors,2,function(x) cor(x,snp.gen))
+}
+
+cand = cbind(cand,tmp)
+str(cand)
+
+# check duplicated SNPs
+length(cand$snp[duplicated(cand$snp)])
+
+# find which axis has duplicates
+tmp = cbind(cand$axis, duplicated(cand$snp))
+for (i in 1:6) {
+  print(table(tmp[tmp[,1]==i,2]))
+}
+
+# remove duplicates
+cand = cand[!duplicated(cand$snp),]
+head(cand);dim(cand)
+
+# find the most strongly correlated environmental predictor with each outlier SNP
+nc = ncol(cand)
+
+for (i in 1:nrow(cand)) {
+  bar = cand[i,]
+  cand[i,nc+1] = names(which.max(abs(bar[4:9])))
+  cand[i,nc+2] = max(abs(bar[4:9]))}
+colnames(cand)[nc+1] = "predictor"
+colnames(cand)[nc+2] = "correlation"
+
+table(cand$predictor)
+
+write.table (cand, file="env_data/res/candSNPs_pRDA_sd3_ancestryCorrected.txt", quote=FALSE, sep ="\t",row.name =FALSE, col.name= TRUE)
+
+# handling regions using Script 4
+
+########
+# plot SNPs
+#######
+head(cand);dim(cand)
+sel = cand$snp
+env = cand$predictor
+env[env=="bare"] = '#1f78b4'
+env[env=="cec"] = '#a6cee3'
+env[env=="bio_11"] = '#6a3d9a'
+env[env=="srad_06"] = '#e31a1c'
+env[env=="trees"] = '#33a02c'
+env[env=="cropland"] = '#ffff33'
+head(env);dim(env)
+length(env)
+# color by predictor:
+col.pred = rownames(rda_partial$CCA$v) # pull the SNP names
+
+for (i in 1:length(sel)) {           # color code candidate SNPs
+  foo = match(sel[i],col.pred)
+  col.pred[foo] = env[i]
+}
+
+length(col.pred)
+head(col.pred)
+
+col.pred[grep("_",col.pred)] = '#f1eef6' # non-candidate SNPs using unique symbols in the name of SNPs
+
+empty = col.pred
+empty[grep("#f1eef6",empty)] = rgb(0,1,0, alpha=0) # transparent
+empty.outline = ifelse(empty=="#00FF0000","#00FF0000","gray32")
+bg = c('#1f78b4','#a6cee3','#6a3d9a','#e31a1c','#33a02c','#ffff33')
+
+# axes 1 & 2
+tiff(file="env_data/fig/rda1_vs_rda2_ancestryCorrected_SNPs.tiff", compression="lzw", width=3000, height=2700,res = 300)
+plot(rda_partial, type="n", scaling=3, xlim=c(-1,1), ylim=c(-1,1))
+points(rda_partial, display="species", pch=21, cex=1, col="gray32", bg=col.pred, scaling=3)
+points(rda_partial, display="species", pch=21, cex=1, col=empty.outline, bg=empty, scaling=3)
+text(rda_partial, scaling=3, display="bp", col="#0868ac", cex=1)
+legend("bottomright", legend=c("bare","cec","bio_11","srad_06","trees","cropland"), bty="n", col="gray32", pch=21, cex=1, pt.bg=bg)
+dev.off()
+
+# axes 1 & 3
+tiff(file="env_data/fig/rda1_vs_rda3_ancestryCorrected_SNPs.tiff", compression="lzw", width=3000, height=2700,res = 300)
+plot(rda_partial, type="n", scaling=3, xlim=c(-1,1), ylim=c(-1,1), choices=c(1,3))
+points(rda_partial, display="species", pch=21, cex=1, col="gray32", bg=col.pred, scaling=3, choices=c(1,3))
+points(rda_partial, display="species", pch=21, cex=1, col=empty.outline, bg=empty, scaling=3, choices=c(1,3))
+text(rda_partial, scaling=3, display="bp", col="#0868ac", cex=1, choices=c(1,3))
+legend("bottomright", legend=c("bare","cec","bio_11","srad_06","trees","cropland"), bty="n", col="gray32", pch=21, cex=1, pt.bg=bg)
+dev.off()
+
+
+########
+# RDA Plot (not run)
+#######
+population <-env_dat1014$breed
+pop_col <- as.integer(1:44)
+pop_pch <- as.integer(1:44)
+# RDA1 vs RDA2 without legend
+jpeg("rda1_vs_rda2_ancestryCorrected.jpg")
+plot(rda_partial, choices = c(1, 2), xlab="RDA1 (22%)", ylab="RDA2 (19%)", scaling=3)
+points(rda_partial, display="species", col="salmon", scaling=3)
+points(rda_partial, display="sites", pch=pop_pch[population], cex=0.8, col=pop_col[population], scaling=3)
+text(rda_partial, scaling=3, display="bp", col="black", cex=1)
+dev.off()
+# Create only Legend and then crop legend part and place side by side the main plot
+
+jpeg("pop_legend_ancestryCorrected.jpg")
+par(xpd=T, mar=c(5,4,4,7))
+plot(rda_partial, type="n")
+legend("topright", legend=unique(population), bty="o", col=pop_col, pch=pop_pch, cex=1)
+dev.off()
+
+
+
+
